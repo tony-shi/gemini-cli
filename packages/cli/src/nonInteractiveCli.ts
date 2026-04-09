@@ -30,6 +30,8 @@ import {
   ToolErrorType,
   Scheduler,
   ROOT_SCHEDULER_ID,
+  GeminiCliOperation,
+  runInDevTraceSpan,
 } from '@google/gemini-cli-core';
 
 import type { Content, Part } from '@google/genai';
@@ -188,7 +190,14 @@ export async function runNonInteractive(
 
     let errorToHandle: unknown | undefined;
     let scheduler: Scheduler | undefined;
-    try {
+    const spanMetadata: Record<string, unknown> = { input };
+    await runInDevTraceSpan(
+      {
+        operation: GeminiCliOperation.UserPrompt,
+        attributes: spanMetadata,
+      },
+      async (_span) => {
+        try {
       consolePatcher.patch();
 
       if (
@@ -525,6 +534,7 @@ export async function runNonInteractive(
       }
     } catch (error) {
       errorToHandle = error;
+      spanMetadata.error = error;
     } finally {
       // Cleanup stdin cancellation before other cleanup
       cleanupStdinCancellation();
@@ -533,6 +543,8 @@ export async function runNonInteractive(
       consolePatcher.cleanup();
       coreEvents.off(CoreEvent.UserFeedback, handleUserFeedback);
     }
+      },
+    );
 
     if (errorToHandle) {
       handleError(errorToHandle, config);
