@@ -54,6 +54,20 @@ const mockCoreEvents = vi.hoisted(() => ({
 }));
 
 const mockSchedulerSchedule = vi.hoisted(() => vi.fn());
+const mockRunInDevTraceSpan = vi.hoisted(() =>
+  vi.fn().mockImplementation(
+    (
+      _opts: unknown,
+      fn: (ctx: {
+        metadata: {
+          input?: unknown;
+          error?: unknown;
+          attributes: Record<string, unknown>;
+        };
+      }) => Promise<unknown>,
+    ) => fn({ metadata: { input: undefined, attributes: {} } }),
+  ),
+);
 
 vi.mock('@google/gemini-cli-core', async (importOriginal) => {
   const original =
@@ -83,6 +97,8 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
       stdout: process.stdout,
       stderr: process.stderr,
     })),
+    runInDevTraceSpan: mockRunInDevTraceSpan,
+    GeminiCliOperation: original.GeminiCliOperation,
   };
 });
 
@@ -133,6 +149,19 @@ describe('runNonInteractive', () => {
 
   beforeEach(async () => {
     mockSchedulerSchedule.mockReset();
+    mockRunInDevTraceSpan.mockReset();
+    mockRunInDevTraceSpan.mockImplementation(
+      (
+        _opts: unknown,
+        fn: (ctx: {
+          metadata: {
+            input?: unknown;
+            error?: unknown;
+            attributes: Record<string, unknown>;
+          };
+        }) => Promise<unknown>,
+      ) => fn({ metadata: { input: undefined, attributes: {} } }),
+    );
 
     mockCommandServiceCreate.mockResolvedValue({
       getCommands: mockGetCommands,
@@ -2233,5 +2262,30 @@ describe('runNonInteractive', () => {
       expect(output).toContain('"type":"tool_result"');
       expect(output).toContain('"status":"success"');
     });
+  });
+
+  it('wraps execution in a UserPrompt trace span', async () => {
+    const events: ServerGeminiStreamEvent[] = [
+      {
+        type: GeminiEventType.Finished,
+        value: { reason: undefined, usageMetadata: { totalTokenCount: 0 } },
+      },
+    ];
+    mockGeminiClient.sendMessageStream.mockReturnValue(
+      createStreamFromEvents(events),
+    );
+
+    await runNonInteractive({
+      config: mockConfig,
+      settings: mockSettings,
+      input: 'hello world',
+      prompt_id: 'prompt-id-trace',
+    });
+
+    const { GeminiCliOperation } = await import('@google/gemini-cli-core');
+    expect(mockRunInDevTraceSpan).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: GeminiCliOperation.UserPrompt }),
+      expect.any(Function),
+    );
   });
 });
