@@ -12,6 +12,7 @@ import type {
   AnyDeclarativeTool,
   AnyToolInvocation,
   UserFeedbackPayload,
+  SpanMetadata,
 } from '@google/gemini-cli-core';
 import {
   ToolErrorType,
@@ -22,6 +23,7 @@ import {
   CoreEvent,
   CoreToolCallStatus,
   JsonStreamEventType,
+  GeminiCliOperation,
 } from '@google/gemini-cli-core';
 import type { Part } from '@google/genai';
 import { runNonInteractive } from './nonInteractiveCli.js';
@@ -55,6 +57,26 @@ const mockCoreEvents = vi.hoisted(() => ({
 }));
 
 const mockSchedulerSchedule = vi.hoisted(() => vi.fn());
+const mockRunInDevTraceSpan = vi.hoisted(() =>
+  vi.fn().mockImplementation(
+    (
+      _opts: unknown,
+      fn: (ctx: {
+        metadata: {
+          name: string;
+          input?: unknown;
+          error?: unknown;
+          attributes: Record<string, unknown>;
+        };
+      }) => Promise<unknown>,
+    ) => fn({ metadata: { name: '', attributes: {} } }),
+  ),
+);
+const mockRunNonInteractiveAgentSession = vi.hoisted(() => vi.fn());
+
+vi.mock('./nonInteractiveCliAgentSession.js', () => ({
+  runNonInteractive: mockRunNonInteractiveAgentSession,
+}));
 
 vi.mock('@google/gemini-cli-core', async (importOriginal) => {
   const original =
@@ -84,6 +106,8 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
       stdout: process.stdout,
       stderr: process.stderr,
     })),
+    runInDevTraceSpan: mockRunInDevTraceSpan,
+    GeminiCliOperation: original.GeminiCliOperation,
   };
 });
 
@@ -134,6 +158,22 @@ describe('runNonInteractive', () => {
 
   beforeEach(async () => {
     mockSchedulerSchedule.mockReset();
+    mockRunInDevTraceSpan.mockReset();
+    mockRunInDevTraceSpan.mockImplementation(
+      (
+        _opts: unknown,
+        fn: (ctx: {
+          metadata: {
+            name: string;
+            input?: unknown;
+            error?: unknown;
+            attributes: Record<string, unknown>;
+          };
+        }) => Promise<unknown>,
+      ) => fn({ metadata: { name: '', attributes: {} } }),
+    );
+    mockRunNonInteractiveAgentSession.mockReset();
+    mockRunNonInteractiveAgentSession.mockResolvedValue(undefined);
 
     mockCommandServiceCreate.mockResolvedValue({
       getCommands: mockGetCommands,
@@ -193,6 +233,8 @@ describe('runNonInteractive', () => {
       getRawOutput: vi.fn().mockReturnValue(false),
       getAcceptRawOutputRisk: vi.fn().mockReturnValue(false),
       getAgentSessionNoninteractiveEnabled: vi.fn().mockReturnValue(false),
+      getTelemetryLogPromptsEnabled: vi.fn().mockReturnValue(true),
+      getTelemetryTracesEnabled: vi.fn().mockReturnValue(true),
     } as unknown as Config;
 
     mockSettings = {
@@ -2571,6 +2613,76 @@ describe('runNonInteractive', () => {
       const output = getWrittenOutput();
       expect(output).toContain('"type":"tool_result"');
       expect(output).toContain('"status":"success"');
+    });
+  });
+
+  it('wraps legacy execution in a UserPrompt trace span', async () => {
+    const events: ServerGeminiStreamEvent[] = [
+      {
+        type: GeminiEventType.Finished,
+        value: { reason: undefined, usageMetadata: { totalTokenCount: 0 } },
+      },
+    ];
+    mockGeminiClient.sendMessageStream.mockReturnValue(
+      createStreamFromEvents(events),
+    );
+
+    await runNonInteractive({
+      config: mockConfig,
+      settings: mockSettings,
+      input: 'hello world',
+      prompt_id: 'prompt-id-trace',
+    });
+
+    expect(mockRunInDevTraceSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: GeminiCliOperation.UserPrompt,
+        sessionId: 'test-session-id',
+        logPrompts: true,
+        tracesEnabled: true,
+      }),
+      expect.any(Function),
+    );
+    expect(mockRunNonInteractiveAgentSession).not.toHaveBeenCalled();
+  });
+
+  it('wraps agent-session execution in a UserPrompt trace span', async () => {
+    vi.mocked(mockConfig.getAgentSessionNoninteractiveEnabled).mockReturnValue(
+      true,
+    );
+    const executionOrder: string[] = [];
+    const metadata: SpanMetadata = { name: '', attributes: {} };
+    mockRunInDevTraceSpan.mockImplementationOnce(async (_opts, fn) => {
+      executionOrder.push('span:start');
+      const result = await fn({ metadata });
+      executionOrder.push('span:end');
+      return result;
+    });
+    mockRunNonInteractiveAgentSession.mockImplementationOnce(async () => {
+      executionOrder.push('agent-session');
+    });
+
+    await runNonInteractive({
+      config: mockConfig,
+      settings: mockSettings,
+      input: 'hello agent session',
+      prompt_id: 'prompt-id-agent-trace',
+    });
+
+    expect(executionOrder).toEqual(['span:start', 'agent-session', 'span:end']);
+    expect(metadata.input).toBe('hello agent session');
+    expect(mockRunInDevTraceSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: GeminiCliOperation.UserPrompt,
+        sessionId: 'test-session-id',
+      }),
+      expect.any(Function),
+    );
+    expect(mockRunNonInteractiveAgentSession).toHaveBeenCalledWith({
+      config: mockConfig,
+      settings: mockSettings,
+      input: 'hello agent session',
+      prompt_id: 'prompt-id-agent-trace',
     });
   });
 });

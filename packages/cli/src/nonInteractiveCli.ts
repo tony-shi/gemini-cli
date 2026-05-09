@@ -9,6 +9,7 @@ import type {
   ToolCallRequestInfo,
   ResumedSessionData,
   UserFeedbackPayload,
+  SpanMetadata,
 } from '@google/gemini-cli-core';
 import { isSlashCommand } from './ui/utils/commandUtils.js';
 import type { LoadedSettings } from './config/settings.js';
@@ -30,6 +31,8 @@ import {
   ToolErrorType,
   Scheduler,
   ROOT_SCHEDULER_ID,
+  GeminiCliOperation,
+  runInDevTraceSpan,
 } from '@google/gemini-cli-core';
 
 import type { Content, Part } from '@google/genai';
@@ -66,11 +69,39 @@ interface RunNonInteractiveParams {
 export async function runNonInteractive(
   params: RunNonInteractiveParams,
 ): Promise<void> {
-  const useAgentSession = params.config.getAgentSessionNoninteractiveEnabled();
-  if (useAgentSession) {
-    return runNonInteractiveAgentSession(params);
-  }
+  const { config, input } = params;
 
+  // The root user_prompt span represents the CLI invocation, so it wraps the
+  // dispatcher before choosing the legacy or agent-session execution path.
+  return runInDevTraceSpan(
+    {
+      operation: GeminiCliOperation.UserPrompt,
+      logPrompts: config.getTelemetryLogPromptsEnabled(),
+      sessionId: config.getSessionId(),
+      tracesEnabled: config.getTelemetryTracesEnabled(),
+    },
+    async ({ metadata }) => {
+      metadata.input = input;
+      try {
+        if (config.getAgentSessionNoninteractiveEnabled()) {
+          return await runNonInteractiveAgentSession(params);
+        }
+
+        return await runLegacyNonInteractive(params, metadata);
+      } catch (error) {
+        if (metadata.error === undefined) {
+          metadata.error = error;
+        }
+        throw error;
+      }
+    },
+  );
+}
+
+async function runLegacyNonInteractive(
+  params: RunNonInteractiveParams,
+  spanMetadata: SpanMetadata,
+): Promise<void> {
   const { config, settings, input, prompt_id, resumedSessionData } = params;
 
   return promptIdContext.run(prompt_id, async () => {
@@ -588,6 +619,7 @@ export async function runNonInteractive(
       }
     } catch (error) {
       errorToHandle = error;
+      spanMetadata.error = error;
     } finally {
       // Cleanup stdin cancellation before other cleanup
       cleanupStdinCancellation();
